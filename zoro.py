@@ -24,16 +24,42 @@ recognizer = sr.Recognizer()
 speak_lock = threading.Lock()
 
 
+# ---------- SETTINGS YOU CAN CHANGE ----------
+VOICE_HINT = "zira"      # part of a voice name, e.g. "zira", "david", "mark"
+VOICE_RATE = 175         # speaking speed (150 = slow, 200 = fast)
+AWAKE_SECONDS = 30       # how long Zoro stays awake after hearing his name
+WAKE_PATTERN = re.compile(r"\b(zoro|zorro|zero|joro)\b")   # names Zoro answers to
+
+
 # ---------- VOICE OUTPUT ----------
+def pick_voice(engine):
+    for v in engine.getProperty("voices"):
+        if VOICE_HINT.lower() in v.name.lower():
+            engine.setProperty("voice", v.id)
+            return
+
+
 def speak(text):
     print("Zoro:", text)
     with speak_lock:
         if pythoncom:
             pythoncom.CoInitialize()
         engine = pyttsx3.init()
+        pick_voice(engine)
+        engine.setProperty("rate", VOICE_RATE)
         engine.say(text)
         engine.runAndWait()
         engine.stop()
+
+
+def show_voices():
+    try:
+        engine = pyttsx3.init()
+        names = [v.name for v in engine.getProperty("voices")]
+        engine.stop()
+        print("Voices on this PC:", " | ".join(names))
+    except Exception:
+        pass
 
 
 # ---------- VOICE INPUT ----------
@@ -65,7 +91,6 @@ SYSTEM_PROMPT = (
 )
 
 # Zoro asks Groq which models your key can use, then tries them in this order.
-# Models not in your list are ignored automatically.
 PREFERRED_GROQ = [
     "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
@@ -291,8 +316,8 @@ def clear_reminders():
 
 
 # ---------- COMMANDS ----------
-STOP_WORDS = ["stop", "exit", "quit", "goodbye", "good bye", "bye",
-              "shut down", "shutdown", "go to sleep"]
+STOP_WORDS = ["stop", "exit", "quit", "goodbye", "good bye", "bye", "shut down", "shutdown"]
+SLEEP_WORDS = ["go to sleep", "sleep now", "be quiet", "that's all", "thats all", "that is all"]
 
 
 def is_stop(command):
@@ -303,12 +328,22 @@ def is_stop(command):
     return any(w in command for w in STOP_WORDS)
 
 
+def is_sleep(command):
+    if len(command.split()) > 6:
+        return False
+    return any(w in command for w in SLEEP_WORDS)
+
+
 def open_camera():
     subprocess.Popen("start microsoft.windows.camera:", shell=True)
 
 
 def handle(command):
-    """Returns False when Zoro should shut down."""
+    """Returns True (keep going), False (quit Zoro) or "sleep" (wait for his name)."""
+
+    if is_sleep(command):
+        speak("Okay, going to sleep. Say Zoro when you need me.")
+        return "sleep"
 
     if is_stop(command):
         speak("Goodbye Einstein")
@@ -366,15 +401,38 @@ def main():
     load_reminders()
     if groq_client is None:
         print("Note: AI brain is OFF (no GROQ_API_KEY found in .env).")
-    speak("Zoro is online. How can I help?")
+    show_voices()
+    speak("Zoro is online. Say my name when you need me.")
+
     running = True
+    awake_until = time.time() + AWAKE_SECONDS   # awake for the first 30 seconds
+
     while running:
         heard = listen()
         if not heard:
             continue
-        heard = heard.replace("zoro", "").strip()
-        if heard:
-            running = handle(heard)
+
+        woke = WAKE_PATTERN.search(heard) is not None
+        if woke:
+            heard = WAKE_PATTERN.sub("", heard).strip(" ,.!?")
+
+        awake = woke or time.time() < awake_until
+        if not awake:
+            print("(sleeping: say 'Zoro' first)")
+            continue
+
+        if not heard:                       # he only heard his name
+            awake_until = time.time() + AWAKE_SECONDS
+            speak("Yes Einstein?")
+            continue
+
+        result = handle(heard)
+        if result is False:
+            running = False
+        elif result == "sleep":
+            awake_until = 0
+        else:
+            awake_until = time.time() + AWAKE_SECONDS   # stay awake for follow-ups
 
 
 try:

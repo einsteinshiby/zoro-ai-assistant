@@ -75,7 +75,7 @@ Tip: speak a full sentence in one go. Short single words are recognized less rel
 - [x] App launching and web search
 - [x] Reminders
 - [x] AI question answering
-- [ ] Wake word ("Zoro")
+- [x] Wake word ("Zoro")
 - [ ] More natural voice
 - [ ] Desktop window with buttons
 - [ ] Music and weather commands
