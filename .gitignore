@@ -1,0 +1,4 @@
+.env
+zoro-env/
+reminders.json
+__pycache__/
