@@ -20,15 +20,20 @@ except ImportError:
 
 load_dotenv()  # reads your key from the .env file
 
-recognizer = sr.Recognizer()
-speak_lock = threading.Lock()
-
 
 # ---------- SETTINGS YOU CAN CHANGE ----------
-VOICE_HINT = "zira"      # part of a voice name, e.g. "zira", "david", "mark"
-VOICE_RATE = 175         # speaking speed (150 = slow, 200 = fast)
-AWAKE_SECONDS = 30       # how long Zoro stays awake after hearing his name
+VOICE_HINT = "zira"          # part of a voice name, e.g. "zira", "david"
+VOICE_RATE = 175             # speaking speed (150 = slow, 200 = fast)
+AWAKE_SECONDS = 30           # how long Zoro stays awake after hearing his name
+SPEECH_LANGUAGE = "en-IN"    # "en-IN" Indian English, "en-US" American, "en-GB" British
+PAUSE_SECONDS = 1.2          # how long a pause ends your sentence
+SHOW_STARTUP_INFO = False    # True = print the voices and AI models at startup
+DEBUG_SLEEP = False          # True = show what Zoro hears while he is asleep
 WAKE_PATTERN = re.compile(r"\b(zoro|zorro|zero|joro)\b")   # names Zoro answers to
+
+recognizer = sr.Recognizer()
+recognizer.pause_threshold = PAUSE_SECONDS
+speak_lock = threading.Lock()
 
 
 # ---------- VOICE OUTPUT ----------
@@ -63,22 +68,26 @@ def show_voices():
 
 
 # ---------- VOICE INPUT ----------
-def listen():
+def listen(quiet=False):
+    """quiet=True prints nothing (used while Zoro is asleep)."""
     with sr.Microphone() as source:
-        recognizer.adjust_for_ambient_noise(source, duration=0.5)
-        print("Listening...")
+        if quiet:
+            recognizer.adjust_for_ambient_noise(source, duration=0.2)
+        else:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            print("Listening...")
         try:
-            audio = recognizer.listen(source, timeout=8, phrase_time_limit=10)
+            audio = recognizer.listen(source, timeout=8, phrase_time_limit=12)
         except sr.WaitTimeoutError:
             return ""
     try:
-        text = recognizer.recognize_google(audio)
-        print("You said:", text)
-        return text.lower()
+        return recognizer.recognize_google(audio, language=SPEECH_LANGUAGE).lower()
     except sr.UnknownValueError:
         return ""
     except sr.RequestError:
-        print("Zoro: No internet or the speech service is down.")
+        if not quiet:
+            print("Zoro: No internet or the speech service is down.")
+        time.sleep(2)
         return ""
 
 
@@ -117,7 +126,8 @@ def discover_groq_models():
         print("(could not get the Groq model list:", str(e)[:120], ")")
         return list(PREFERRED_GROQ)
     chat = [i for i in ids if not any(w in i.lower() for w in NOT_CHAT_WORDS)]
-    print("Groq models available to you:", ", ".join(chat) if chat else "NONE")
+    if SHOW_STARTUP_INFO:
+        print("Groq models available to you:", ", ".join(chat) if chat else "NONE")
     ordered = [m for m in PREFERRED_GROQ if m in chat]
     ordered += [m for m in chat if m not in ordered]
     return ordered
@@ -319,6 +329,10 @@ def clear_reminders():
 STOP_WORDS = ["stop", "exit", "quit", "goodbye", "good bye", "bye", "shut down", "shutdown"]
 SLEEP_WORDS = ["go to sleep", "sleep now", "be quiet", "that's all", "thats all", "that is all"]
 
+TIME_PHRASES = ["what time is it", "what is the time", "what's the time", "whats the time",
+                "what is time", "tell me the time", "current time", "time now",
+                "time is it", "the time please", "what time it is"]
+
 
 def is_stop(command):
     # only counts as a stop request if it is a short sentence,
@@ -332,6 +346,20 @@ def is_sleep(command):
     if len(command.split()) > 6:
         return False
     return any(w in command for w in SLEEP_WORDS)
+
+
+def is_time_question(command):
+    if len(command.split()) > 8 or "zone" in command:
+        return False
+    return any(p in command for p in TIME_PHRASES)
+
+
+def is_date_question(command):
+    if len(command.split()) > 8 or " of " in command:
+        return False
+    if re.search(r"\bdate\b", command) and re.search(r"\b(what|whats|what's|tell|current|today)\b", command):
+        return True
+    return "what day" in command or "what's today" in command or "what is today" in command
 
 
 def open_camera():
@@ -362,11 +390,11 @@ def handle(command):
         speak("Opening camera")
         open_camera()
 
-    elif "what time" in command or "current time" in command:
+    elif is_time_question(command):
         now = datetime.datetime.now().strftime("%I:%M %p")
         speak(f"It is {now}")
 
-    elif "what date" in command or "today's date" in command or "what day" in command:
+    elif is_date_question(command):
         today = datetime.datetime.now().strftime("%A, %d %B %Y")
         speak(f"Today is {today}")
 
@@ -401,27 +429,30 @@ def main():
     load_reminders()
     if groq_client is None:
         print("Note: AI brain is OFF (no GROQ_API_KEY found in .env).")
-    show_voices()
+    if SHOW_STARTUP_INFO:
+        show_voices()
     speak("Zoro is online. Say my name when you need me.")
 
     running = True
-    awake_until = time.time() + AWAKE_SECONDS   # awake for the first 30 seconds
+    awake_until = 0   # Zoro starts asleep and stays silent until he hears his name
 
     while running:
-        heard = listen()
+        asleep = time.time() >= awake_until
+        heard = listen(quiet=asleep)
         if not heard:
             continue
 
         woke = WAKE_PATTERN.search(heard) is not None
+        if asleep and not woke:
+            if DEBUG_SLEEP:
+                print(f"(asleep, heard: {heard})")
+            continue                      # asleep and no name heard: stay silent
+
+        print("You said:", heard)
         if woke:
             heard = WAKE_PATTERN.sub("", heard).strip(" ,.!?")
 
-        awake = woke or time.time() < awake_until
-        if not awake:
-            print("(sleeping: say 'Zoro' first)")
-            continue
-
-        if not heard:                       # he only heard his name
+        if not heard:                     # he only heard his name
             awake_until = time.time() + AWAKE_SECONDS
             speak("Yes Einstein?")
             continue
