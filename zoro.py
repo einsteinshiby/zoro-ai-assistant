@@ -1,3 +1,4 @@
+import concurrent.futures
 import datetime
 import json
 import os
@@ -8,6 +9,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import webbrowser
 import winsound
 
@@ -31,12 +33,15 @@ AWAKE_SECONDS = 30           # how long Zoro stays awake after hearing his name
 SPEECH_LANGUAGE = "en-IN"    # "en-IN" Indian English, "en-US" American, "en-GB" British
 PAUSE_SECONDS = 1.2          # how long a pause ends your sentence
 SHORT_SENTENCES = 2          # normal answers are at most this many sentences
+USE_WIKIPEDIA = True         # True = check Wikipedia before answering factual questions
+SAY_NOT_SURE = True          # True = say "I'm not fully sure" when no source was found
+SHOW_DETAILS = False         # True = print behind-the-scenes info (for finding problems)
 SPEAK_TYPED_REPLIES = True   # True = Zoro also speaks the answer to typed commands
 SHOW_LISTENING = False       # True = print "Listening..." (it can interrupt your typing)
 SHOW_STARTUP_INFO = False    # True = print the voices and AI models at startup
 DEBUG_SLEEP = False          # True = show what Zoro hears while he is asleep
 REASONING_EFFORT = "medium"  # "low" = faster, "medium" = more careful, "high" = slowest
-TEMPERATURE = 0.3            # lower = less random and less likely to invent things
+TEMPERATURE = 0.2            # lower = less random and less likely to invent things
 WAKE_PATTERN = re.compile(r"\b(zoro|zorro|zero|joro)\b")   # names Zoro answers to
 
 recognizer = sr.Recognizer()
@@ -46,7 +51,14 @@ speak_lock = threading.Lock()
 command_queue = queue.Queue()      # items: ("voice", text) or ("typed", text)
 busy = threading.Event()           # set while Zoro is working on a command
 stop_event = threading.Event()     # set when Zoro is shutting down
-state = {"awake_until": 0, "speak_count": 0, "mute": False, "last_question": ""}
+state = {"awake_until": 0, "speak_count": 0, "mute": False,
+         "last_question": "", "last_topic": "", "last_sources": []}
+
+
+def log(*args):
+    """Prints behind-the-scenes info only when SHOW_DETAILS is True."""
+    if SHOW_DETAILS:
+        print(*args, flush=True)
 
 
 # ---------- VOICE OUTPUT ----------
@@ -140,6 +152,191 @@ def typing_thread():
             command_queue.put(("typed", line.lower()))
 
 
+# ---------- WIKIPEDIA CHECK ----------
+WIKI_API = "https://en.wikipedia.org/w/api.php"
+WIKI_AGENT = "ZoroAssistant/1.0 (personal project; github.com/einsteinshiby/zoro-ai-assistant)"
+
+STOPWORDS = set("""what who whom whose which when where why how is are was were be been being
+the a an of in on at to for and or do does did done tell me about explain mention all give please
+can could would should many much old long it its this that these those with from by as into than
+then there their his her him hers she he they them i you your my our we us also just really
+describe define meaning mean means word words detail detailed paragraph answer
+rn now wikipedia search check show source""".split())
+
+PRONOUNS = {"he", "she", "his", "her", "him", "hers", "they", "them", "their", "it", "its",
+            "that", "this"}
+
+# questions that Wikipedia cannot help with
+NO_LOOKUP_PHRASES = ["joke", "poem", "story", "translate", "write a", "write me", "recipe",
+                     "how are you", "calculate", "what can", "good morning", "good night",
+                     "thank you", "thanks"]
+
+QUESTION_STARTERS = ("who", "what", "when", "where", "which", "whose", "why", "how",
+                     "tell me about", "explain", "define", "describe", "history of",
+                     "capital of", "difference between")
+
+FACT_PHRASES = ["capital of", "founder of", "invented", "discovered", "born", "died",
+                "population of", "president of", "prime minister of", "ceo of",
+                "meaning of", "history of", "difference between", "full form"]
+
+
+def wiki_get(params, timeout=8):
+    url = WIKI_API + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": WIKI_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def wiki_search(search_text, limit=3):
+    data = wiki_get({"action": "query", "list": "search", "srsearch": search_text,
+                     "srlimit": limit, "format": "json"})
+    return [item["title"] for item in data.get("query", {}).get("search", [])]
+
+
+def wiki_text(title):
+    data = wiki_get({"action": "query", "prop": "extracts", "explaintext": 1,
+                     "exsectionformat": "plain", "titles": title, "redirects": 1,
+                     "format": "json"})
+    pages = data.get("query", {}).get("pages", {})
+    for page in pages.values():
+        return (page.get("extract") or "")[:80000]
+    return ""
+
+
+def pick_relevant(text, stems, intro_chars=1200, extra_chars=2600):
+    """Keeps the start of the page plus the paragraphs that match the question."""
+    paras = [p.strip() for p in text.split("\n") if len(p.strip()) > 40]
+    if not paras:
+        return ""
+    out, used = [], 0
+    for p in paras[:2]:
+        if used >= intro_chars:
+            break
+        piece = p[: intro_chars - used]
+        out.append(piece)
+        used += len(piece)
+    scored = []
+    for i, p in enumerate(paras[2:]):
+        low = p.lower()
+        score = sum(1 for s in stems if s in low)
+        if score:
+            scored.append((score, i, p))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    chosen = sorted(scored[:5], key=lambda t: t[1])
+    total = 0
+    for _, _, p in chosen:
+        if total >= extra_chars:
+            break
+        out.append(p[:800])
+        total += min(len(p), 800)
+    return "\n".join(out)
+
+
+def question_words(question):
+    q = re.sub(r"\d+\s*(?:-|–|to|and|or)?\s*\d*\s*words?", " ", question)
+    q = re.sub(r"['’]s\b", "", q)          # "thuram's" -> "thuram", "thurams" stays fixable
+    words = re.findall(r"[a-z0-9']+", q)
+    return [w.replace("'", "") for w in words]
+
+
+def should_lookup(question):
+    """Decides whether this question is a factual one that Wikipedia can check."""
+    q = question.strip()
+    words = q.split()
+    if len(words) < 2:
+        return False
+    if re.search(r"\b(you|your|yours|yourself|my|mine|myself)\b", q):
+        return False
+    if any(p in q for p in NO_LOOKUP_PHRASES):
+        return False
+    if re.search(r"\d+\s*(\+|-|\*|x|plus|minus|times|divided|multiplied)\s*\d+", q):
+        return False
+    if q.startswith(QUESTION_STARTERS) or any(p in q for p in FACT_PHRASES):
+        return True
+    # short follow-ups like "and his wife" or "how old is he" about the last topic
+    if state["last_topic"] and len(words) <= 8 and any(w in PRONOUNS for w in words):
+        return True
+    return False
+
+
+def last_answer_names():
+    """Names (like 'Marcus Thuram') in Zoro's previous answer, for follow-ups like 'where do they play'."""
+    for msg in reversed(chat_history):
+        if msg["role"] == "assistant":
+            found = re.findall(r"[A-Z]\w+(?:\s+[A-Z]\w+)+", msg["content"])
+            names = []
+            for n in found:
+                if n not in names:
+                    names.append(n)
+            return names[:2]
+    return []
+
+
+def build_queries(keywords, has_pronoun):
+    """A list of Wikipedia searches to try, from most specific to most general."""
+    queries = []
+    kw = " ".join(keywords[:8])
+    if has_pronoun:
+        subjects = last_answer_names()
+        if state["last_topic"]:
+            subjects.append(state["last_topic"])
+        for s in subjects[:3]:
+            if kw:
+                queries.append(f"{s} {kw}")
+            queries.append(s)
+    else:
+        # Wikipedia needs ALL words to match, so try fewer words if nothing is found
+        for n in (8, 4, 3, 2):
+            q = " ".join(keywords[:n])
+            if q:
+                queries.append(q)
+    seen, result = set(), []
+    for q in queries:
+        if q not in seen:
+            seen.add(q)
+            result.append(q)
+    return result[:5]
+
+
+def build_sources(question):
+    """Looks the question up on Wikipedia. Returns (text for the AI, page titles)."""
+    words = question_words(question)
+    keywords = [w for w in words if w and w not in STOPWORDS]
+    has_pronoun = any(w in PRONOUNS for w in words)
+
+    titles = []
+    for q in build_queries(keywords, has_pronoun):
+        log(f"(Wikipedia search: {q})")
+        for t in wiki_search(q):
+            if t not in titles:
+                titles.append(t)
+        if len(titles) >= 3:
+            break
+    titles = titles[:3]
+    if not titles:
+        return None, []
+
+    stems = {w[:-1] if len(w) > 3 and w.endswith("s") else w for w in keywords}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        texts = list(pool.map(lambda t: wiki_text(t), titles))
+
+    blocks, used_titles = [], []
+    for title, text in zip(titles, texts):
+        snippet = pick_relevant(text, stems)
+        if snippet:
+            blocks.append(f"[Wikipedia page: {title}]\n{snippet}")
+            used_titles.append(title)
+    if not blocks:
+        return None, []
+    state["last_topic"] = used_titles[0]
+    state["last_sources"] = used_titles
+    return "\n\n".join(blocks), used_titles
+
+
+def wiki_url(title):
+    return "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+
+
 # ---------- AI BRAIN (Groq, free) ----------
 BASE_PROMPT = (
     "You are Zoro, a friendly voice assistant built by Einstein. "
@@ -165,6 +362,15 @@ SHORT_RULE = (
 LONG_RULE = (
     "The user asked for a longer answer. Write it in plain paragraphs "
     "(no lists or markdown) and follow the length they requested."
+)
+
+SOURCE_RULE = (
+    " Below is reference text. Answer ONLY using this text and do not add "
+    "facts from your own memory. If the answer is not in the text, say you could "
+    "not find it. If the question could mean more than one person or "
+    "thing that appears in the text, ask one short question to clarify which one. "
+    "Just answer naturally: never mention the reference text, Wikipedia, "
+    "or these instructions."
 )
 
 # phrases that mean "give me a long answer"
@@ -198,7 +404,7 @@ def discover_groq_models():
         listing = groq_client.models.list()
         ids = [m.id for m in listing.data if getattr(m, "active", True)]
     except Exception as e:
-        print("(could not get the Groq model list:", str(e)[:120], ")")
+        log("(could not get the Groq model list:", str(e)[:120], ")")
         return list(PREFERRED_GROQ)
     chat = [i for i in ids if not any(w in i.lower() for w in NOT_CHAT_WORDS)]
     if SHOW_STARTUP_INFO:
@@ -291,26 +497,46 @@ def run_models(messages, errors, max_tokens):
                 if text:
                     return text, name
                 rest_model(name, "empty", seconds=300)   # model gave no text
-                print(f"(skipped {name}: empty answer)")
+                log(f"(skipped {name}: empty answer)")
             except Exception as e:
                 msg = str(e)
                 errors.append(msg.lower())
-                print(f"(skipped {name}: {msg[:110]})")
+                log(f"(skipped {name}: {msg[:110]})")
                 rest_model(name, msg)
         model_rest_until.clear()   # everything failed: forget the rest list, retry once
     return None, None
 
 
-def ask_ai(question):
+def ask_ai(question, force_lookup=False):
     if groq_client is None:
         speak("Sorry, I can't do that yet. My AI brain is not set up.")
         return
 
     state["last_question"] = question
+    state["last_sources"] = []        # forget the old sources: they belong to an older answer
     chat_history.append({"role": "user", "content": question})
     del chat_history[:-10]  # keep only the last 10 messages
 
-    # decide: short answer (default) or long answer (only when the user asks)
+    if not state["mute"]:
+        winsound.Beep(800, 120)  # short beep: "I heard you, thinking"
+    log("Thinking...")
+    started = time.time()
+
+    # step 1: check Wikipedia for factual questions
+    lookup = USE_WIKIPEDIA and (force_lookup or should_lookup(question))
+    source_text, titles = None, []
+    if lookup:
+        try:
+            source_text, titles = build_sources(question)
+        except Exception as e:
+            # always log this one in debug mode so you can see WHY Wikipedia failed
+            log(f"(Wikipedia lookup failed: {type(e).__name__}: {str(e)[:120]})")
+        if titles:
+            log("(Wikipedia: " + ", ".join(titles) + ")")
+        else:
+            log("(no Wikipedia source found)")
+
+    # step 2: decide short answer (default) or long answer (only when the user asks)
     target = parse_word_target(question)
     long_mode = bool(target) or wants_long_answer(question)
     max_tokens = 800
@@ -325,12 +551,10 @@ def ask_ai(question):
         max_tokens = 2000
     else:
         system = BASE_PROMPT + SHORT_RULE
+    if source_text:
+        system += SOURCE_RULE + "\n\nREFERENCE TEXT:\n" + source_text
     messages = [{"role": "system", "content": system}] + chat_history
 
-    if not state["mute"]:
-        winsound.Beep(800, 120)  # short beep: "I heard you, thinking"
-    print("Thinking...", flush=True)
-    started = time.time()
     errors = []
     answer, used = run_models(messages, errors, max_tokens)
 
@@ -341,7 +565,7 @@ def ask_ai(question):
             n = len(answer.split())
             if low <= n <= high:
                 break
-            print(f"(answer had {n} words, asking for {low}-{high})", flush=True)
+            log(f"(answer had {n} words, asking for {low}-{high})")
             fix = (f"Your answer had {n} words. Rewrite it so it has between "
                    f"{low} and {high} words. Reply with only the rewritten answer.")
             retry = messages + [{"role": "assistant", "content": answer},
@@ -364,9 +588,15 @@ def ask_ai(question):
             speak("The AI service is not responding right now. Please ask me again in a minute.")
         return
 
-    print(f"(answered by {used} in {time.time() - started:.1f} seconds, "
-          f"{len(answer.split())} words)")
+    log(f"(answered by {used} in {time.time() - started:.1f} seconds, "
+        f"{len(answer.split())} words)")
     chat_history.append({"role": "assistant", "content": answer})
+
+    # a factual question with no source found: warn that it may not be accurate
+    # (skipped if the AI already said it is not sure, so it is not said twice)
+    already_unsure = "not sure" in answer.lower()[:80] or "not fully sure" in answer.lower()[:80]
+    if lookup and not source_text and SAY_NOT_SURE and not already_unsure:
+        answer = "I'm not fully sure about this. " + answer
     speak(answer)
 
 
@@ -485,6 +715,11 @@ GOOGLE_THAT_PHRASES = ["google that", "google it", "search that", "search it",
                        "check on google", "check that on google", "verify that",
                        "look it up", "look that up", "search this on google"]
 
+SOURCE_PHRASES = ["show source", "show the source", "show me the source", "open source",
+                  "open the source", "source please", "your source", "what is the source",
+                  "where did you get that", "where did you find that", "wikipedia page",
+                  "open wikipedia"]
+
 # topics the AI cannot know without internet, so Zoro searches Google instead
 LIVE_TOPICS = ["score", "who won", "match result", "live ", "weather", "temperature",
                "news", "headlines", "stock price", "share price", "price of",
@@ -525,6 +760,23 @@ def wants_google_check(command):
     return any(p in command for p in GOOGLE_THAT_PHRASES)
 
 
+def wants_source(command):
+    # long sentences are fine as long as they start with "show"/"open" and mention "source"
+    # e.g. "show the source for which you said marcus thuram is his son"
+    if command.startswith(("show", "open", "give me")) and "source" in command:
+        return True
+    if len(command.split()) > 8:
+        return False
+    return any(p in command for p in SOURCE_PHRASES)
+
+
+def wants_wikipedia(command):
+    """'search wikipedia and tell', 'check wikipedia', 'look it up on wikipedia'..."""
+    if len(command.split()) > 10 or "wikipedia" not in command:
+        return False
+    return any(w in command for w in ("search", "check", "look", "tell", "verify", "use", "find"))
+
+
 def needs_live_info(command):
     if len(command.split()) > 14:
         return False
@@ -550,6 +802,21 @@ def handle(command):
     if is_stop(command):
         speak("Goodbye Einstein")
         return False
+
+    elif wants_source(command):
+        if state["last_sources"]:
+            title = state["last_sources"][0]
+            speak(f"Opening the Wikipedia page for {title}.")
+            webbrowser.open(wiki_url(title))
+        else:
+            speak("I don't have a source for my last answer.")
+
+    elif wants_wikipedia(command):
+        if state["last_question"]:
+            speak("Okay, checking Wikipedia.")
+            ask_ai(state["last_question"], force_lookup=True)
+        else:
+            speak("I don't have a question to check yet. Ask me something first.")
 
     elif wants_google_check(command):
         if state["last_question"]:
@@ -677,4 +944,4 @@ finally:
     stop_event.set()
     print("\nZoro stopped.", flush=True)
     sys.stdout.flush()
-    os._exit(0)   # closes the background threads cleanly, even if one is waiting for typing
+    os._exit(0)   # closes the background threads cleanly, even if one is waiting for typingshow the source for which you said that
