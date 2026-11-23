@@ -42,6 +42,8 @@ SHOW_STARTUP_INFO = False    # True = print the voices and AI models at startup
 DEBUG_SLEEP = False          # True = show what Zoro hears while he is asleep
 REASONING_EFFORT = "medium"  # "low" = faster, "medium" = more careful, "high" = slowest
 TEMPERATURE = 0.2            # lower = less random and less likely to invent things
+DEFAULT_CITY = "Hyderabad"   # city used when you just say "what's the weather"
+DEFAULT_COUNTRY = "IN"       # city names are matched in this country first ("IN" = India, "" = off)
 WAKE_PATTERN = re.compile(r"\b(zoro|zorro|zero|joro)\b")   # names Zoro answers to
 
 recognizer = sr.Recognizer()
@@ -703,6 +705,87 @@ def clear_reminders():
     speak("All reminders cleared. Ones already running may still ring once.")
 
 
+# ---------- WEATHER (Open-Meteo: free, no key needed) ----------
+WEATHER_WORDS = ["weather", "temperature", "forecast", "will it rain", "is it raining",
+                 "how hot", "how cold"]
+
+
+def http_json(url, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": WIKI_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def weather_description(code):
+    if code == 0:
+        return "clear"
+    if code in (1, 2):
+        return "partly cloudy"
+    if code == 3:
+        return "cloudy"
+    if code in (45, 48):
+        return "foggy"
+    if 51 <= code <= 57:
+        return "drizzling"
+    if 61 <= code <= 67 or 80 <= code <= 82:
+        return "raining"
+    if 71 <= code <= 77 or code in (85, 86):
+        return "snowing"
+    if code >= 95:
+        return "stormy"
+    return "unsettled"
+
+
+def is_weather_question(command):
+    if len(command.split()) > 12:
+        return False
+    return any(w in command for w in WEATHER_WORDS)
+
+
+def city_from_command(command):
+    """'weather in mumbai' -> 'mumbai'. No city said -> DEFAULT_CITY."""
+    c = re.sub(r"\b(today|tomorrow|now|right now|rn|please|currently)\b", " ", command)
+    m = re.search(r"\b(?:in|for|at)\s+([a-z][a-z .'-]*)$", c.strip())
+    if not m:
+        return DEFAULT_CITY
+    city = re.sub(r"^[^a-z]+|[^a-z]+$", "", m.group(1))   # drop stray ' . - or spaces at the ends
+    return city or DEFAULT_CITY
+
+
+def tell_weather(command):
+    city = city_from_command(command)
+    try:
+        geo = http_json("https://geocoding-api.open-meteo.com/v1/search?" +
+                        urllib.parse.urlencode({"name": city, "count": 10}))
+        results = geo.get("results")
+        if not results:
+            speak(f"I could not find a place called {city}.")
+            return
+        # prefer a place in your own country (so "kochi" means Kerala, not Japan)
+        place = results[0]
+        for r in results:
+            if DEFAULT_COUNTRY and r.get("country_code", "").upper() == DEFAULT_COUNTRY.upper():
+                place = r
+                break
+        log(f"(weather place: {place['name']}, {place.get('admin1', '')}, {place.get('country', '')})")
+        data = http_json("https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode({
+            "latitude": place["latitude"], "longitude": place["longitude"],
+            "current": "temperature_2m,apparent_temperature,weather_code",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "timezone": "auto", "forecast_days": 1}))
+        now = data["current"]
+        day = data["daily"]
+        speak(f"It is {round(now['temperature_2m'])} degrees and "
+              f"{weather_description(now['weather_code'])} in {place['name']}, "
+              f"feels like {round(now['apparent_temperature'])}. "
+              f"Today's high is {round(day['temperature_2m_max'][0])}, "
+              f"low {round(day['temperature_2m_min'][0])}, "
+              f"with a {day['precipitation_probability_max'][0]} percent chance of rain.")
+    except Exception as e:
+        log(f"(weather failed: {type(e).__name__}: {str(e)[:100]})")
+        speak("I could not get the weather right now. Please try again in a minute.")
+
+
 # ---------- COMMANDS ----------
 STOP_WORDS = ["stop", "exit", "quit", "goodbye", "good bye", "bye", "shut down", "shutdown"]
 SLEEP_WORDS = ["go to sleep", "sleep now", "be quiet", "that's all", "thats all", "that is all"]
@@ -825,6 +908,9 @@ def handle(command):
         else:
             speak("I don't have a question to check yet. Ask me something first.")
 
+    elif is_weather_question(command):
+        tell_weather(command)
+
     elif "remind me" in command:
         add_reminder(command)
 
@@ -944,4 +1030,4 @@ finally:
     stop_event.set()
     print("\nZoro stopped.", flush=True)
     sys.stdout.flush()
-    os._exit(0)   # closes the background threads cleanly, even if one is waiting for typingshow the source for which you said that
+    os._exit(0)   # closes the background threads cleanly, even if one is waiting for typing

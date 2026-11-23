@@ -11,6 +11,7 @@ Zoro is a voice-controlled personal assistant for Windows, built in Python. You 
 - **Time and date:** "what time is it", "what's the date"
 - **Ask anything:** general questions answered by an AI model, with short-term conversation memory
 - **Automatic model selection:** Zoro asks Groq which models your key can use and falls back to others if one fails
+- **Wikipedia fact-checking:** factual questions are checked against Wikipedia first, and "show source" opens the page used
 
 ## Requirements
 
